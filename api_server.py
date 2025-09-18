@@ -31,7 +31,11 @@ app.add_middleware(
 # Répertoires de travail
 UPLOAD_DIR = "/workspace/uploads"
 OUTPUT_DIR = "/workspace/outputs"
-WEIGHTS_DIR = "/workspace/weights"
+
+# Vérifier d'abord le stockage persistent, sinon local
+PERSISTENT_WEIGHTS = "/workspace/persistent/weights"
+LOCAL_WEIGHTS = "/workspace/weights"
+WEIGHTS_DIR = PERSISTENT_WEIGHTS if os.path.exists(PERSISTENT_WEIGHTS) else LOCAL_WEIGHTS
 
 # Créer les répertoires s'ils n'existent pas
 for dir_path in [UPLOAD_DIR, OUTPUT_DIR, WEIGHTS_DIR]:
@@ -49,12 +53,44 @@ INFINITETALK_CONFIG = {
     "num_persistent_param_in_dit": 0  # Pour économiser la VRAM
 }
 
+# Vérification au démarrage
+@app.on_event("startup")
+async def startup_event():
+    """Vérification des modèles requis au démarrage"""
+    logger.info(f"🚀 Démarrage de l'API InfiniteTalk")
+    logger.info(f"📁 Répertoire des poids utilisé: {WEIGHTS_DIR}")
+    
+    required_models = [
+        INFINITETALK_CONFIG["ckpt_dir"],
+        INFINITETALK_CONFIG["wav2vec_dir"],
+        INFINITETALK_CONFIG["infinitetalk_dir"]
+    ]
+    
+    missing_models = [m for m in required_models if not os.path.exists(m)]
+    
+    if missing_models:
+        logger.error(f"⚠️ Modèles manquants: {missing_models}")
+        logger.error("Exécutez setup_infinitetalk.sh pour télécharger les modèles")
+        logger.warning("L'API peut ne pas fonctionner correctement sans ces modèles")
+    else:
+        logger.info("✅ Tous les modèles sont chargés et prêts")
+    
+    # Afficher l'espace disque disponible
+    try:
+        disk_usage = shutil.disk_usage(WEIGHTS_DIR)
+        free_gb = disk_usage.free / (1024**3)
+        total_gb = disk_usage.total / (1024**3)
+        logger.info(f"💾 Espace disque: {free_gb:.1f}GB libre sur {total_gb:.1f}GB total")
+    except Exception as e:
+        logger.warning(f"Impossible de vérifier l'espace disque: {e}")
+
 @app.get("/")
 async def root():
     """Endpoint de base pour vérifier que l'API fonctionne"""
     return {
         "message": "InfiniteTalk API is running",
         "version": "1.0.0",
+        "weights_dir": WEIGHTS_DIR,
         "endpoints": {
             "health": "/health",
             "generate": "/generate",
@@ -75,7 +111,6 @@ async def health_check():
         ])
         
         # Vérifier l'espace disque disponible
-        import shutil
         disk_usage = shutil.disk_usage("/workspace")
         free_gb = disk_usage.free / (1024**3)
         
@@ -83,6 +118,7 @@ async def health_check():
             "status": "healthy",
             "gpu_available": True,
             "models_loaded": models_exist,
+            "weights_dir": WEIGHTS_DIR,
             "free_disk_gb": round(free_gb, 2),
             "queue_size": len(processing_queue)
         }
