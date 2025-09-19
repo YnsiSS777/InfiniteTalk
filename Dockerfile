@@ -1,33 +1,38 @@
-# Image GPU prête pour Runpod (PyTorch + CUDA + Python 3.10)
+# Image GPU prête pour RunPod (PyTorch + CUDA + Python 3.10)
 FROM runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# On travaille sous /app (ton code + repo InfiniteTalk)
 WORKDIR /app
 
-# Paquets système utiles (ffmpeg fréquent pour audio/vidéo)
+# Outils système utiles
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg git git-lfs && \
     git lfs install && \
     rm -rf /var/lib/apt/lists/*
 
-# (Facultatif) si tu as un requirements.txt, on l’installe d'abord pour profiter du cache
+# Dépendances Python
+# Assure-toi que requirements.txt contient au moins: runpod, soundfile, librosa, numpy (torch est déjà fourni par l'image)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && \
-    if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+    pip install --no-cache-dir -r /app/requirements.txt
 
-# Copie du code
+# --- Code de TON endpoint serverless (incluant handler.py) ---
+# Le fichier handler.py doit contenir:
+#   if __name__ == "__main__":
+#       runpod.serverless.start({"handler": handler})
 COPY . /app
 
-# Si besoin d’épingler numpy/opencv, dé-commente :
-# RUN pip install --no-cache-dir "numpy==1.26.*" "opencv-python-headless"
+# --- (Optionnel) Bake du repo InfiniteTalk au build ---
+# Si ton repo local ne contient pas déjà InfiniteTalk/, décommente la ligne suivante
+# pour cloner la version officielle directement DANS l'image (au build, pas au runtime).
+# RUN git clone --depth 1 https://github.com/MeiGen-AI/InfiniteTalk.git /app/InfiniteTalk
 
-# Expose le port de ton app (Gradio/FastAPI)
-EXPOSE 7860
+# Pas de port à exposer en mode serverless
+# EXPOSE 7860
 
-# ✏️ REMPLACE app.py par ton script de lancement
-# Exemples :
-#   Gradio:  python app.py
-#   FastAPI: uvicorn main:app --host 0.0.0.0 --port 7860
-CMD ["python", "app.py"]
+# Démarrage: lance directement le handler RunPod Serverless
+# IMPORTANT: ton handler utilise WORKSPACE_DIR="/app/InfiniteTalk" et WEIGHTS_DIR="/workspace/weights"
+CMD ["python", "/app/handler.py"]
