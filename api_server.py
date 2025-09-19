@@ -39,25 +39,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Répertoires
+# Répertoires de travail
 UPLOAD_DIR = "/workspace/uploads"
 OUTPUT_DIR = "/workspace/outputs"
-
-PERSISTENT_WEIGHTS = "/workspace/persistent/weights"
-LOCAL_WEIGHTS = "/workspace/weights"
-WEIGHTS_DIR = PERSISTENT_WEIGHTS if os.path.exists(PERSISTENT_WEIGHTS) else LOCAL_WEIGHTS
-
-for d in (UPLOAD_DIR, OUTPUT_DIR, WEIGHTS_DIR):
+for d in (UPLOAD_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
+
+# Chemins MODELS —> configurable par env
+MODELS_DIR = os.getenv("MODELS_DIR", "/workspace/persistent/models")  # <- chez toi c’est ici
+LOCAL_FALLBACK = "/workspace/models"  # fallback si besoin
+if not os.path.exists(MODELS_DIR) and os.path.exists(LOCAL_FALLBACK):
+    MODELS_DIR = LOCAL_FALLBACK
+
+logger.info(f"📁 MODELS_DIR = {MODELS_DIR}")
 
 # File d'attente en mémoire (statuts)
 processing_queue = {}
 
-# Config InfiniteTalk
+# Config InfiniteTalk (aligne avec ton disque)
 INFINITETALK_CONFIG = {
-    "ckpt_dir": f"{WEIGHTS_DIR}/Wan2.1-I2V-14B-480P",
-    "wav2vec_dir": f"{WEIGHTS_DIR}/chinese-wav2vec2-base",
-    "infinitetalk_dir": f"{WEIGHTS_DIR}/InfiniteTalk/single/infinitetalk.safetensors",
+    "ckpt_dir": f"{MODELS_DIR}/Wan2.1-I2V-14B-480P",
+    "wav2vec_dir": f"{MODELS_DIR}/chinese-wav2vec2-base",
+    "infinitetalk_dir": f"{MODELS_DIR}/InfiniteTalk/single/infinitetalk.safetensors",
     "motion_frame": 9,
     "num_persistent_param_in_dit": 0
 }
@@ -72,8 +75,8 @@ def _check_models_exist() -> list[str]:
 
 async def _warmup():
     """
-    Optionnel: faire un mini run ou un chargement rapide pour s'assurer que tout est OK GPU/FFmpeg.
-    Ici on se contente de vérifier la présence des dossiers.
+    Ici, simple vérification de présence des modèles.
+    Si besoin tu peux charger un encodeur léger pour tester CUDA/FFmpeg.
     """
     missing = _check_models_exist()
     if missing:
@@ -87,19 +90,16 @@ async def _warmup():
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Démarrage de l'API InfiniteTalk (HTTP mode)")
-    logger.info(f"📁 WEIGHTS_DIR = {WEIGHTS_DIR}")
-
+    logger.info("🚀 Démarrage InfiniteTalk API (HTTP mode)")
     try:
-        disk = shutil.disk_usage(WEIGHTS_DIR)
-        logger.info(f"💾 Free {disk.free/1e9:.1f} GB / Total {disk.total/1e9:.1f} GB")
+        if os.path.exists(MODELS_DIR):
+            disk = shutil.disk_usage(MODELS_DIR)
+            logger.info(f"💾 Free {disk.free/1e9:.1f} GB / Total {disk.total/1e9:.1f} GB (dans MODELS_DIR)")
     except Exception as e:
         logger.warning(f"Disk usage check failed: {e}")
 
-    # Pendant l'init -> 204 sur /ping
     READY["ok"] = False
     READY["reason"] = "initializing"
-
     await _warmup()  # bascule READY à True si OK
 
 @app.get("/")
@@ -107,7 +107,7 @@ async def root():
     return {
         "message": "InfiniteTalk API is running",
         "version": "1.0.0",
-        "weights_dir": WEIGHTS_DIR,
+        "models_dir": MODELS_DIR,
         "ready": READY,
         "endpoints": {
             "health": "/health",
@@ -122,23 +122,22 @@ async def root():
 async def health_check():
     try:
         models_exist = len(_check_models_exist()) == 0
-        disk = shutil.disk_usage("/workspace")
+        base = "/workspace"
+        disk = shutil.disk_usage(base) if os.path.exists(base) else None
         return {
             "status": "healthy" if READY["ok"] and models_exist else "initializing",
             "ready": READY,
-            "gpu_available": True,   # tu peux affiner si besoin (torch.cuda.is_available())
+            "gpu_available": True,   # tu peux remplacer par torch.cuda.is_available()
             "models_loaded": models_exist,
-            "weights_dir": WEIGHTS_DIR,
-            "free_disk_gb": round(disk.free/(1024**3), 2),
+            "models_dir": MODELS_DIR,
+            "free_disk_gb": round(disk.free/(1024**3), 2) if disk else None,
             "queue_size": len(processing_queue)
         }
     except Exception as e:
         logger.exception("Health check failed")
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
-# --------- endpoints métier (ta logique inchangée, juste compacte)
-from pydantic import BaseModel
-
+# --------- endpoint génération (proche du tien)
 @app.post("/generate")
 async def generate_video(
     background_tasks: BackgroundTasks,
@@ -162,13 +161,13 @@ async def generate_video(
         raise HTTPException(400, "La résolution doit être 480 ou 720")
 
     task_id = str(uuid.uuid4())
-    logger.info(f"Nouvelle tâche: {task_id}")
-
     try:
+        # audio
         audio_path = f"{UPLOAD_DIR}/{task_id}_audio.wav"
         with open(audio_path, "wb") as f:
             f.write(await audio.read())
 
+        # input
         input_type = "image"
         input_path = None
         if image:
@@ -183,6 +182,7 @@ async def generate_video(
                 f.write(await video.read())
             input_type = "video"
 
+        # config job
         config = {
             "input_type": input_type,
             "input_path": input_path,
@@ -219,9 +219,7 @@ async def generate_video(
             "message": "Vidéo en cours de génération",
             "estimated_time_seconds": 60 if resolution == "480" else 90
         }
-
     except Exception as e:
-        logger.exception("Erreur création tâche")
         processing_queue.pop(task_id, None)
         raise HTTPException(500, str(e))
 
@@ -229,7 +227,6 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
                         steps: int, audio_cfg: float, text_cfg: float,
                         use_lora: bool, lora_scale: float):
     try:
-        logger.info(f"Traitement {task_id} démarré")
         processing_queue[task_id]["status"] = "processing"
         processing_queue[task_id]["progress"] = 10
 
@@ -250,16 +247,14 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
         ]
 
         if use_lora:
-            lora_path = f"{WEIGHTS_DIR}/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+            lora_path = f"{MODELS_DIR}/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
             if os.path.exists(lora_path):
                 cmd += ["--lora_dir", lora_path, "--lora_scale", str(lora_scale),
                         "--sample_steps", "8", "--sample_shift", "2"]
-                logger.info("LoRA activé")
 
         processing_queue[task_id]["progress"] = 20
-        logger.info("Commande: %s", " ".join(cmd))
 
-        # IMPORTANT: cwd = /workspace/InfiniteTalk (doit exister dans l'image!)
+        # IMPORTANT: cwd = /workspace/InfiniteTalk
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd="/workspace/InfiniteTalk"
@@ -289,18 +284,14 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
                 "completed_at": datetime.now().isoformat(),
                 "file_size_mb": round(os.path.getsize(out) / (1024*1024), 2)
             })
-            logger.info("✅ Vidéo générée: %s", out)
         else:
             err = (stderr or b"").decode()
-            logger.error("InfiniteTalk stderr: %s", err[:1000])
             raise RuntimeError(err[:500])
 
     except asyncio.CancelledError:
         processing_queue[task_id]["status"] = "cancelled"
         processing_queue[task_id]["error"] = "Tâche annulée"
-        logger.warning("Tâche %s annulée", task_id)
     except Exception as e:
-        logger.exception("Erreur traitement %s", task_id)
         processing_queue[task_id]["status"] = "error"
         processing_queue[task_id]["error"] = str(e)
         processing_queue[task_id]["progress"] = 0
@@ -346,7 +337,6 @@ async def cleanup_task(task_id: str):
         del processing_queue[task_id]
         return {"message": f"Tâche {task_id} nettoyée"}
     except Exception as e:
-        logger.exception("Cleanup error")
         raise HTTPException(500, f"Erreur lors du nettoyage: {e}")
 
 @app.get("/queue")
@@ -369,7 +359,6 @@ async def get_queue_status():
     return summary
 
 if __name__ == "__main__":
-    import uvicorn, os
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-
