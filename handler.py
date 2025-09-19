@@ -15,7 +15,7 @@ import traceback
 import runpod  # léger
 
 # Constantes
-WORKSPACE_DIR = "/workspace/InfiniteTalk"
+WORKSPACE_DIR = "/app/InfiniteTalk"
 WEIGHTS_DIR = "/workspace/weights"
 UPLOAD_DIR = "/tmp/uploads"
 OUTPUT_DIR = "/tmp/outputs"
