@@ -2,7 +2,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import json, uuid, os, subprocess, asyncio, tempfile, shutil, logging
+import json, uuid, os, asyncio, shutil, logging
 from typing import Optional
 from datetime import datetime
 
@@ -21,10 +21,7 @@ def ping():
     204 = en cours d'initialisation
     200 = prêt
     """
-    if READY["ok"]:
-        return ("", 200)
-    else:
-        return ("", 204)
+    return ("", 200) if READY["ok"] else ("", 204)
 
 # ---------------------------
 # API principale
@@ -45,22 +42,64 @@ OUTPUT_DIR = "/workspace/outputs"
 for d in (UPLOAD_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
-# Chemins MODELS —> configurable par env
-MODELS_DIR = os.getenv("MODELS_DIR", "/workspace/persistent/models")  # <- chez toi c’est ici
-LOCAL_FALLBACK = "/workspace/models"  # fallback si besoin
-if not os.path.exists(MODELS_DIR) and os.path.exists(LOCAL_FALLBACK):
-    MODELS_DIR = LOCAL_FALLBACK
+# ---------- AUTO-DÉTECTION MODELS_DIR ----------
+CANDIDATES = [
+    os.getenv("MODELS_DIR", "/workspace/persistent/models"),
+    "/workspace/persistent/models",
+    "/workspace/persistent",
+    "/workspace/data",
+    "/data",
+    "/workspace/models",
+    "/models",
+    "/mnt/models",
+    "/runpod-volume",
+]
+REQS = [
+    ("Wan2.1-I2V-14B-480P", False),  # dossier
+    ("chinese-wav2vec2-base", False),
+    (os.path.join("InfiniteTalk", "single", "infinitetalk.safetensors"), True),  # fichier
+]
 
-logger.info(f"📁 MODELS_DIR = {MODELS_DIR}")
+def _has_all(base: str) -> bool:
+    try:
+        for rel, is_file in REQS:
+            full = os.path.join(base, rel)
+            if is_file:
+                if not os.path.isfile(full):
+                    return False
+            else:
+                if not os.path.isdir(full):
+                    return False
+        return True
+    except Exception:
+        return False
+
+MODELS_DIR = None
+for base in CANDIDATES:
+    if _has_all(base):
+        MODELS_DIR = base
+        break
+if MODELS_DIR is None:
+    # garde la valeur d'env même si manquante pour une erreur explicite
+    MODELS_DIR = os.getenv("MODELS_DIR", "/workspace/persistent/models")
+
+logger.info(f"📁 MODELS_DIR (effective) = {MODELS_DIR}")
 
 # File d'attente en mémoire (statuts)
 processing_queue = {}
+TASK_LOGS = {}  # ring buffer simple pour /logs/{task_id}
 
-# Config InfiniteTalk (aligne avec ton disque)
+def log_task(tid: str, msg: str):
+    arr = TASK_LOGS.setdefault(tid, [])
+    arr.append(msg)
+    if len(arr) > 200:  # limite mémoire
+        TASK_LOGS[tid] = arr[-200:]
+
+# Config InfiniteTalk (utilise MODELS_DIR détecté)
 INFINITETALK_CONFIG = {
-    "ckpt_dir": f"{MODELS_DIR}/Wan2.1-I2V-14B-480P",
-    "wav2vec_dir": f"{MODELS_DIR}/chinese-wav2vec2-base",
-    "infinitetalk_dir": f"{MODELS_DIR}/InfiniteTalk/single/infinitetalk.safetensors",
+    "ckpt_dir": os.path.join(MODELS_DIR, "Wan2.1-I2V-14B-480P"),
+    "wav2vec_dir": os.path.join(MODELS_DIR, "chinese-wav2vec2-base"),
+    "infinitetalk_dir": os.path.join(MODELS_DIR, "InfiniteTalk", "single", "infinitetalk.safetensors"),
     "motion_frame": 9,
     "num_persistent_param_in_dit": 0
 }
@@ -74,10 +113,7 @@ def _check_models_exist() -> list[str]:
     return [p for p in req if not os.path.exists(p)]
 
 async def _warmup():
-    """
-    Ici, simple vérification de présence des modèles.
-    Si besoin tu peux charger un encodeur léger pour tester CUDA/FFmpeg.
-    """
+    """Vérification des modèles et bascule READY."""
     missing = _check_models_exist()
     if missing:
         READY["ok"] = False
@@ -86,21 +122,20 @@ async def _warmup():
     else:
         READY["ok"] = True
         READY["reason"] = "ready"
+        try:
+            if os.path.exists(MODELS_DIR):
+                disk = shutil.disk_usage(MODELS_DIR)
+                logger.info(f"💾 Models dir free {disk.free/1e9:.1f} GB / total {disk.total/1e9:.1f} GB")
+        except Exception as e:
+            logger.warning(f"Disk usage check failed: {e}")
         logger.info("✅ Modèles présents, API prête.")
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Démarrage InfiniteTalk API (HTTP mode)")
-    try:
-        if os.path.exists(MODELS_DIR):
-            disk = shutil.disk_usage(MODELS_DIR)
-            logger.info(f"💾 Free {disk.free/1e9:.1f} GB / Total {disk.total/1e9:.1f} GB (dans MODELS_DIR)")
-    except Exception as e:
-        logger.warning(f"Disk usage check failed: {e}")
-
     READY["ok"] = False
     READY["reason"] = "initializing"
-    await _warmup()  # bascule READY à True si OK
+    await _warmup()
 
 @app.get("/")
 async def root():
@@ -114,7 +149,9 @@ async def root():
             "ping": "/ping (health_app)",
             "generate": "/generate",
             "status": "/status/{task_id}",
-            "download": "/download/{task_id}"
+            "download": "/download/{task_id}",
+            "logs": "/logs/{task_id}",
+            "gpu": "/gpu"
         }
     }
 
@@ -127,7 +164,7 @@ async def health_check():
         return {
             "status": "healthy" if READY["ok"] and models_exist else "initializing",
             "ready": READY,
-            "gpu_available": True,   # tu peux remplacer par torch.cuda.is_available()
+            "gpu_available": True,   # remplaçable par torch.cuda.is_available()
             "models_loaded": models_exist,
             "models_dir": MODELS_DIR,
             "free_disk_gb": round(disk.free/(1024**3), 2) if disk else None,
@@ -137,7 +174,22 @@ async def health_check():
         logger.exception("Health check failed")
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
-# --------- endpoint génération (proche du tien)
+@app.get("/gpu")
+def gpu():
+    """Petit endpoint debug pour voir l'activité GPU."""
+    try:
+        import subprocess, shutil as _sh
+        if not _sh.which("nvidia-smi"):
+            return {"nvidia_smi": "not found"}
+        out = subprocess.check_output([
+            "nvidia-smi","--query-gpu=utilization.gpu,memory.used",
+            "--format=csv,noheader,nounits"
+        ]).decode().strip()
+        return {"nvidia_smi": out}  # ex: "65, 18000"
+    except Exception as e:
+        return {"error": str(e)}
+
+# --------- endpoint génération
 @app.post("/generate")
 async def generate_video(
     background_tasks: BackgroundTasks,
@@ -229,6 +281,7 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
     try:
         processing_queue[task_id]["status"] = "processing"
         processing_queue[task_id]["progress"] = 10
+        log_task(task_id, "build command")
 
         cmd = [
             "python", "generate_infinitetalk.py",
@@ -247,12 +300,13 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
         ]
 
         if use_lora:
-            lora_path = f"{MODELS_DIR}/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+            lora_path = os.path.join(MODELS_DIR, "Wan2.1_I2V_14B_FusionX_LoRA.safetensors")
             if os.path.exists(lora_path):
                 cmd += ["--lora_dir", lora_path, "--lora_scale", str(lora_scale),
                         "--sample_steps", "8", "--sample_shift", "2"]
 
         processing_queue[task_id]["progress"] = 20
+        log_task(task_id, "run generate_infinitetalk.py")
 
         # IMPORTANT: cwd = /workspace/InfiniteTalk
         process = await asyncio.create_subprocess_exec(
@@ -269,6 +323,7 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
         prog_task = asyncio.create_task(fake_progress())
         stdout, stderr = await process.communicate()
         prog_task.cancel()
+        log_task(task_id, f"returncode={process.returncode}")
 
         if process.returncode == 0:
             out = f"{OUTPUT_DIR}/{task_id}_0.mp4"
@@ -284,17 +339,21 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
                 "completed_at": datetime.now().isoformat(),
                 "file_size_mb": round(os.path.getsize(out) / (1024*1024), 2)
             })
+            log_task(task_id, f"completed size={processing_queue[task_id]['file_size_mb']}MB")
         else:
             err = (stderr or b"").decode()
+            log_task(task_id, f"stderr: {err[:500]}")
             raise RuntimeError(err[:500])
 
     except asyncio.CancelledError:
         processing_queue[task_id]["status"] = "cancelled"
         processing_queue[task_id]["error"] = "Tâche annulée"
+        log_task(task_id, "cancelled")
     except Exception as e:
         processing_queue[task_id]["status"] = "error"
         processing_queue[task_id]["error"] = str(e)
         processing_queue[task_id]["progress"] = 0
+        log_task(task_id, f"error: {e}")
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
@@ -314,6 +373,10 @@ async def download_video(task_id: str):
         raise HTTPException(404, "Fichier vidéo non trouvé")
     return FileResponse(output_path, media_type="video/mp4",
                         filename=f"infinitetalk_{task_id}.mp4")
+
+@app.get("/logs/{task_id}")
+def get_logs(task_id: str):
+    return {"task_id": task_id, "logs": TASK_LOGS.get(task_id, [])}
 
 @app.delete("/cleanup/{task_id}")
 async def cleanup_task(task_id: str):
