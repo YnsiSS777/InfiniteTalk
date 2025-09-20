@@ -17,10 +17,7 @@ READY = {"ok": False, "reason": "starting"}
 
 @health_app.get("/ping")
 def ping():
-    """
-    204 = en cours d'initialisation
-    200 = prêt
-    """
+    """204 = en cours d'initialisation ; 200 = prêt"""
     return ("", 200) if READY["ok"] else ("", 204)
 
 # ---------------------------
@@ -85,14 +82,14 @@ if MODELS_DIR is None:
 
 logger.info(f"📁 MODELS_DIR (effective) = {MODELS_DIR}")
 
-# File d'attente en mémoire (statuts)
+# File d'attente en mémoire (statuts) + logs courts
 processing_queue = {}
 TASK_LOGS = {}  # ring buffer simple pour /logs/{task_id}
 
 def log_task(tid: str, msg: str):
     arr = TASK_LOGS.setdefault(tid, [])
     arr.append(msg)
-    if len(arr) > 200:  # limite mémoire
+    if len(arr) > 200:
         TASK_LOGS[tid] = arr[-200:]
 
 # Config InfiniteTalk (utilise MODELS_DIR détecté)
@@ -308,10 +305,20 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
         processing_queue[task_id]["progress"] = 20
         log_task(task_id, "run generate_infinitetalk.py")
 
+        # ENV explicite pour le sous-processus (clé pour débloquer 'import wan')
+        child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = "/workspace/InfiniteTalk:/workspace/InfiniteTalk/src:" + child_env.get("PYTHONPATH", "")
+        # Évite des compils trop larges si extension CUDA est buildée à la volée
+        child_env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")   # Ada (RTX 4090/50xx)
+        child_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
         # IMPORTANT: cwd = /workspace/InfiniteTalk
         process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd="/workspace/InfiniteTalk"
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd="/workspace/InfiniteTalk",
+            env=child_env,
         )
 
         async def fake_progress():
@@ -324,6 +331,20 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
         stdout, stderr = await process.communicate()
         prog_task.cancel()
         log_task(task_id, f"returncode={process.returncode}")
+
+        # Sauvegarder logs complets pour debug
+        err_log = f"{OUTPUT_DIR}/{task_id}.stderr.log"
+        try:
+            with open(err_log, "wb") as f:
+                if stdout:
+                    f.write(b"=== STDOUT ===\n")
+                    f.write(stdout)
+                    f.write(b"\n\n")
+                if stderr:
+                    f.write(b"=== STDERR ===\n")
+                    f.write(stderr)
+        except Exception:
+            pass
 
         if process.returncode == 0:
             out = f"{OUTPUT_DIR}/{task_id}_0.mp4"
@@ -341,8 +362,8 @@ async def process_video(task_id: str, config_path: str, resolution: str, mode: s
             })
             log_task(task_id, f"completed size={processing_queue[task_id]['file_size_mb']}MB")
         else:
-            err = (stderr or b"").decode()
-            log_task(task_id, f"stderr: {err[:500]}")
+            err = (stderr or b"").decode(errors="ignore")
+            log_task(task_id, f"stderr: {err[:1000]}")
             raise RuntimeError(err[:500])
 
     except asyncio.CancelledError:
@@ -376,7 +397,13 @@ async def download_video(task_id: str):
 
 @app.get("/logs/{task_id}")
 def get_logs(task_id: str):
-    return {"task_id": task_id, "logs": TASK_LOGS.get(task_id, [])}
+    # Renvoie le ring buffer + lien vers le fichier stderr si présent
+    log_path = f"{OUTPUT_DIR}/{task_id}.stderr.log"
+    return {
+        "task_id": task_id,
+        "logs": TASK_LOGS.get(task_id, []),
+        "stderr_log_file": log_path if os.path.exists(log_path) else None
+    }
 
 @app.delete("/cleanup/{task_id}")
 async def cleanup_task(task_id: str):
@@ -389,6 +416,7 @@ async def cleanup_task(task_id: str):
             f"{UPLOAD_DIR}/{task_id}_image.png",
             f"{UPLOAD_DIR}/{task_id}_video.mp4",
             f"{UPLOAD_DIR}/{task_id}_config.json",
+            f"{OUTPUT_DIR}/{task_id}.stderr.log",
         ]
         for p in files:
             if os.path.exists(p):
