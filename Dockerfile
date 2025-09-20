@@ -1,33 +1,38 @@
-# Base GPU RunPod (PyTorch, CUDA)
+# Base GPU RunPod (PyTorch 2.1.1 + CUDA 12.1 + Python 3.10)
 FROM runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Paquets système
+# Paquets système essentiels
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg git git-lfs && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg git git-lfs \
+        libsndfile1 libgomp1 \
+        wget curl && \
     git lfs install && \
     rm -rf /var/lib/apt/lists/*
 
 # Dépendances Python
-# Ton requirements.txt doit inclure: fastapi, uvicorn[standard], requests, pydantic>=2
-# + toutes libs InfiniteTalk (transformers, accelerate, safetensors, opencv-python-headless, librosa, soundfile, etc.)
+# IMPORTANT:
+# - Ne réinstalle PAS torch/torchvision/torchaudio (déjà dans l'image)
+# - OpenCV headless pour éviter X/GL
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+RUN python -m pip install --upgrade pip && \
+    pip install -r /app/requirements.txt
 
 # Code
 COPY . /app
 
-# Config par défaut (tu peux aussi les définir dans l'Endpoint RunPod)
-ENV PORT=8000
-ENV PORT_HEALTH=8001
-ENV MODELS_DIR=/workspace/persistent/models
-ENV HF_HOME=/workspace/cache/huggingface
+# Environnement par défaut (surchargés par l'Endpoint si besoin)
+ENV PORT=8000 \
+    PORT_HEALTH=8001 \
+    MODELS_DIR=/workspace/persistent/models \
+    HF_HOME=/workspace/cache/huggingface
 
-# Entrypoint -> HTTP mode
+# start.sh lance health_app + API (HTTP mode)
 RUN chmod +x /app/start.sh
 CMD ["/app/start.sh"]
